@@ -121,7 +121,7 @@ class Transformer(CaptioningModel):
             x_d = x_d.reshape(bs, C, side_dim, side_dim)
             similarity_region = self.SAM(x_d).reshape(bs, -1, self.visual_dim)
             
-            prob_use_text = 0.5 * max(0, (15 - epoch) / 15.0)
+            prob_use_text = 0.5 * max(0, (25 - epoch) / 25.0)
             use_text = torch.rand(1).item() < prob_use_text
 
             if use_text:
