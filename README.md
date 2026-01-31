@@ -4,7 +4,7 @@ This repository contains the implementation of **BPA-Net**, a novel image captio
 
 ## 🚀 Framework Overview
 
-![Framework Architecture](introduction.png)
+![Framework Architecture](model.png)
 
 BPA-Net introduces:
 - **Learnable Semantic Prototypes**: For capturing high-level semantic concepts.
