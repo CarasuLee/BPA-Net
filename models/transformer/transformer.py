@@ -131,7 +131,7 @@ class Transformer(CaptioningModel):
             pure_text_proto = self.TPA(text_feature.unsqueeze(-1))
             
             
-            prob_use_text = 0.5 * max(0, (15 - epoch) / 15.0)
+            prob_use_text = 0.5 * max(0, (25 - epoch) / 25.0)
             use_text = torch.rand(1).item() < prob_use_text
 
             if use_text:

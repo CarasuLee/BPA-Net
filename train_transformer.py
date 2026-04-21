@@ -342,10 +342,10 @@ def train(rank, worldSize, args):
             lr = args.xe_base_lr 
         elif s <= 12:
             lr = args.xe_base_lr * 0.2
-        elif s <= 15:
-            lr = args.xe_base_lr * 0.2 * 0.2
+        # elif s <= 15:
+        #     lr = args.xe_base_lr * 0.2 * 0.2
         else:
-            lr = args.xe_base_lr * 0.2 * 0.2 * 0.2
+            lr = args.xe_base_lr * 0.2 * 0.2
         return lr
     
     def lambda_lr_rl(s):
