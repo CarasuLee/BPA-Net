@@ -3,7 +3,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 from torch.nn.modules.loss import MSELoss 
 from data import ImageField, TextField, RawField
-from data import COCO, DataLoader, Flick30k as Flickr30k
+from data import COCO, DataLoader, Flick30k as Flickr30k, Flickr8k
 import evaluation
 from evaluation import PTBTokenizer, Cider
 
@@ -29,6 +29,42 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.utils.data import DistributedSampler
 
+import csv
+import datetime
+
+def init_csv_logger(exp_name):
+    filename = f'training_log_{exp_name}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch','learning_rate', 'train_loss', 'train_loss_ce', 'train_loss_itm', 'val_loss', 'val_cider', 'val_bleu1', 
+                        'val_bleu4', 'val_meteor', 'val_rouge', 'test_cider', 
+                        'test_bleu1', 'test_bleu4', 'test_meteor', 'test_rouge'])
+    return filename
+
+def write_to_csv(filename, epoch,learning_rate, train_loss, train_loss_ce, train_loss_itm, val_loss, val_scores, test_scores):
+    with open(filename, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            epoch,
+            learning_rate, 
+            train_loss,
+            train_loss_ce,
+            train_loss_itm,
+            val_loss,
+            val_scores.get('CIDEr', 0),
+            val_scores.get('BLEU', [0,0,0,0])[0],
+            val_scores.get('BLEU', [0,0,0,0])[3],
+            val_scores.get('METEOR', 0),
+            val_scores.get('ROUGE', 0),
+            test_scores.get('CIDEr', 0),
+            test_scores.get('BLEU', [0,0,0,0])[0],
+            test_scores.get('BLEU', [0,0,0,0])[3],
+            test_scores.get('METEOR', 0),
+            test_scores.get('ROUGE', 0)
+        ])
+
+import torch.nn.functional as F
+
 def evaluate_loss(model, dataloader, loss_fn, text_field, e, device):
 
     model.eval()
@@ -38,7 +74,7 @@ def evaluate_loss(model, dataloader, loss_fn, text_field, e, device):
             for it, (detections, captions) in enumerate(dataloader):
                 detections, captions = detections.to(device), captions.to(device)
                 text_input = text_field.decode(captions[:, 1:].cpu(), join_words=True)
-                out = model(mode='xe', images=detections, seq=captions, text_input=text_input)
+                out, _, _, _, _, _, _ = model(mode='xe', images=detections, seq=captions, text_input=text_input)
                 captions_gt = captions[:, 1:].contiguous()
                 out = out[:, :-1].contiguous()
                 
@@ -85,27 +121,61 @@ def train_xe(model, dataloader, optim, text_field,  scheduler, loss_fn, e, devic
         print('Learning Rates:', lrs)
     
     running_loss = .0
+    running_loss_ce = .0
+    running_loss_itm = .0
+    running_loss_tim = .0
     with tqdm(desc='Epoch %d - train' % e, unit='it', total=len(dataloader), disable=device!=0) as pbar:
         for it, (detections, captions) in enumerate(dataloader):
             detections, captions = detections.to(device), captions.to(device)
             text_input = text_field.decode(captions[:, 1:].cpu(), join_words=True)
-            out = model(mode='xe', images=detections, seq=captions, text_input=text_input, epoch=e)
+            out, img_features, txt_features, cls_features, text_features, itm_logits_pos, tim_logits_pos = model(mode='xe', images=detections, seq=captions, text_input=text_input, epoch=e)
+            
+            batch_size = captions.size(0)
+            shift_amount = torch.randint(1, max(2, batch_size), (1,)).item() if batch_size > 1 else 1
+            
+            captions_neg = torch.roll(captions, shifts=shift_amount, dims=0)
+            text_input_neg = text_field.decode(captions_neg[:, 1:].cpu(), join_words=True)
+            _, _, _, _, _, itm_logits_neg, _ = model.module(mode='xe', images=detections, seq=captions_neg, text_input=text_input_neg, epoch=e, compute_decoder=False)
+            
+            detections_neg = torch.roll(detections, shifts=shift_amount, dims=0)
+            _, _, _, _, _, _, tim_logits_neg = model.module(mode='xe', images=detections_neg, seq=captions, text_input=text_input, epoch=e, compute_decoder=False)
+            
             optim.zero_grad()
             captions_gt = captions[:, 1:].contiguous()
             out = out[:, :-1].contiguous()
 
-            loss = loss_fn(out.view(-1, len(text_field.vocab)), captions_gt.view(-1))
+            loss_ce = loss_fn(out.view(-1, len(text_field.vocab)), captions_gt.view(-1))
+
+            pos_labels = torch.ones(itm_logits_pos.size(0), dtype=torch.long, device=device)
+            neg_labels = torch.zeros(itm_logits_neg.size(0), dtype=torch.long, device=device)
+            
+            loss_itm_pos = F.cross_entropy(itm_logits_pos, pos_labels)
+            loss_itm_neg = F.cross_entropy(itm_logits_neg, neg_labels)
+            loss_itm = (loss_itm_pos + loss_itm_neg) / 2
+            
+            loss_tim_pos = F.cross_entropy(tim_logits_pos, pos_labels)
+            loss_tim_neg = F.cross_entropy(tim_logits_neg, neg_labels)
+            loss_tim = (loss_tim_pos + loss_tim_neg) / 2
+
+            loss = loss_ce + loss_itm + loss_tim
 
             loss.backward()
             optim.step()
             this_loss = loss.item()
             running_loss += this_loss
+            running_loss_ce += loss_ce.item()
+            running_loss_itm += loss_itm.item()
+            running_loss_tim += loss_tim.item()
 
-            pbar.set_postfix(loss=f"{running_loss / (it + 1):.3f}")
+            pbar.set_postfix(loss=f"{running_loss / (it + 1):.3f}", ce=f"{running_loss_ce / (it + 1):.3f}", 
+                             itm=f"{running_loss_itm / (it + 1):.3f}", tim=f"{running_loss_tim / (it + 1):.3f}")
             pbar.update()
 
     loss = running_loss / len(dataloader)
-    return loss
+    loss_ce = running_loss_ce / len(dataloader)
+    loss_itm_avg = (running_loss_itm + running_loss_tim) / (2 * len(dataloader))
+    return loss, loss_ce, loss_itm_avg
+
 
 
 def train_scst(model, dataloader, optim, cider, text_field,  scheduler_rl, e, device):
@@ -115,7 +185,8 @@ def train_scst(model, dataloader, optim, cider, text_field,  scheduler_rl, e, de
     model.train()
     scheduler_rl.step()
     if device == 0:
-        print('lr = ', optim.state_dict()['param_groups'][0]['lr'])
+        lrs = [group['lr'] for group in optim.state_dict()['param_groups']]
+        print('Learning Rates:', lrs)
 
     running_loss = .0
     seq_len = 20
@@ -178,12 +249,15 @@ def train(rank, worldSize, args):
     
     if rank == 0:
         print('Rank{}: Transformer Training'.format(rank))
+    if rank == 0:
+        csv_filename = init_csv_logger(args.exp_name)
+        print(f'Training log will be saved to: {csv_filename}')
         
         epoch_save_dir = 'saved_transformer_models/epoch_save'
         os.makedirs(epoch_save_dir, exist_ok=True)
         print(f'Epoch models will be saved to: {epoch_save_dir}')
 
-    from data import ImageDetectionsField
+    from data import ImageDetectionsField 
     
     if args.use_extracted_features:
         if rank == 0:
@@ -196,7 +270,11 @@ def train(rank, worldSize, args):
 
     if args.exp_name == 'COCO':
         dataset = COCO(image_field, text_field, args.img_root_path, args.annotation_folder, args.annotation_folder)
-    else :
+    elif args.exp_name == 'Flickr30k':
+        dataset = Flickr30k(image_field, text_field, args.img_root_path, args.annotation_folder, args.annotation_folder)
+    elif args.exp_name == 'Flickr8k':
+        dataset = Flickr8k(image_field, text_field, args.img_root_path, args.annotation_folder, args.annotation_folder)
+    else:
         dataset = Flickr30k(image_field, text_field, args.img_root_path, args.annotation_folder, args.annotation_folder)
     
     train_dataset, val_dataset, test_dataset = dataset.splits
@@ -226,24 +304,27 @@ def train(rank, worldSize, args):
     current_text_dim = 768
     
     encoder = TransformerEncoder(3, 0, attention_module=ScaledDotProductAttention, attention_module_kwargs={'m': args.m}, d_in=current_visual_dim)
-    decoder = TransformerDecoderLayer(len(text_field.vocab), 54, 3, text_field.vocab.stoi['<pad>'])
-
-    head_model = Transformer(text_field.vocab.stoi['<bos>'], encoder, decoder, args.num_clusters, len(text_field.vocab), 54, text_field.vocab.stoi['<pad>'], 
+    decoder = TransformerDecoderLayer(len(text_field.vocab), 1000, 3, text_field.vocab.stoi['<pad>'])
+    head_model = Transformer(text_field.vocab.stoi['<bos>'], encoder, decoder, args.num_clusters, len(text_field.vocab), 1000, text_field.vocab.stoi['<pad>'], 
                              text_d_model=current_text_dim, visual_dim=current_visual_dim, clip_model_name=args.clip_model_path)
     
     if args.train_clip_text:
         print(f"Rank{rank}: Unfreezing CLIP Text Encoder")
         for p in head_model.text_encoder.parameters():
             p.requires_grad = True
-
-    trainable_visual = args.train_clip_visual if not args.use_extracted_features else False
+    trainable_visual = (args.train_clip_visual or args.train_clip_visual_layers > 0) if not args.use_extracted_features else False
     
     model = FrozenBackboneModel(backbone, head_model, trainable=trainable_visual).to(device)
     if trainable_visual and rank == 0:
         print("Unfreezing CLIP Visual Encoder")
+        if args.train_clip_visual_layers > 0:
+            print(f"Applying partial unfreezing to last {args.train_clip_visual_layers} layers of CLIP Visual Encoder")
     elif args.use_extracted_features and rank == 0:
         print("Using extracted features: CLIP Visual Encoder skipped/frozen (Identity).")
 
+    if args.train_clip_visual_layers > 0 and not args.use_extracted_features:
+        backbone.partial_unfreeze(args.train_clip_visual_layers)
+        
     model = torch.nn.parallel.DistributedDataParallel(model.to(rank), device_ids=[rank], output_device=rank, broadcast_buffers=False, find_unused_parameters=True)
  
     dict_dataset_train = train_dataset.image_dictionary({'image': image_field, 'text': RawField(), 'add_text':text_field})
@@ -363,7 +444,7 @@ def train(rank, worldSize, args):
 
             if args.force_rl:
                 use_rl = True
-                optim_rl = Adam(model.parameters(), lr=1, betas=(0.9, 0.98))
+                optim_rl = Adam(optimizer_grouped_parameters, lr=1, betas=(0.9, 0.98))
                 scheduler_rl = LambdaLR(optim_rl, lambda_lr_rl)
                 for k in range(start_epoch - 1):
                     scheduler_rl.step()
@@ -384,11 +465,12 @@ def train(rank, worldSize, args):
         dict_dataloader_test = DataLoader(dict_dataset_test, batch_size=args.batch_size // 5)
         
         if not use_rl:
-            train_loss = train_xe(model, dataloader_train, optim, text_field, scheduler, loss_fn, e, rank)
+            train_loss, train_loss_ce, train_loss_itm = train_xe(model, dataloader_train, optim, text_field, scheduler, loss_fn, e, rank)
             if rank == 0:
                 pass
         else:
             train_loss, reward, reward_baseline = train_scst(model, dict_dataloader_train, optim_rl, cider_train, text_field, scheduler_rl, e, rank)
+            train_loss_ce, train_loss_itm = 0.0, 0.0
             if rank == 0:
                 pass
 
@@ -405,13 +487,13 @@ def train(rank, worldSize, args):
                 current_lr = optim_rl.param_groups[0]['lr']
             print("Validation scores", scores)
 
-        # Test scores
         test_scores = evaluate_metrics(model, dict_dataloader_test, text_field, e, rank)
         test_cider = test_scores['CIDEr']
         if rank == 0:
             print("Test scores", test_scores)
+            write_to_csv(csv_filename, e, current_lr, train_loss, train_loss_ce, train_loss_itm, val_loss, scores, test_scores)
             
-            if e > 10:
+            if e > 100:
                 epoch_save_path = f'saved_transformer_models/epoch_save/{args.exp_name}_epoch_{e}.pth'
                 torch.save({
                     'torch_rng_state': torch.get_rng_state(),
@@ -525,8 +607,8 @@ def train(rank, worldSize, args):
 if __name__ == '__main__':    
     parser = argparse.ArgumentParser(description='Transformer')
     parser.add_argument('--exp_name', type=str, default='COCO') 
-    parser.add_argument('--batch_size', type=int, default= 50) 
-    parser.add_argument('--workers', type=int, default=8)  
+    parser.add_argument('--batch_size', type=int, default= 120) 
+    parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--m', type=int, default=40)
     parser.add_argument('--head', type=int, default=8)
     parser.add_argument('--warmup', type=int, default=10000)
@@ -545,12 +627,13 @@ if __name__ == '__main__':
     parser.add_argument('--rl_base_lr', type=float, default=5e-6)
     parser.add_argument('--num_clusters', type=int, default=6) 
     parser.add_argument('--text2text', type=int, default=0)
-    parser.add_argument('--force_rl', action='store_true', help='Force switch to RL stage after resuming')
-    parser.add_argument('--train_clip_visual', action='store_true', required=True, help='Unfreeze CLIP visual encoder')
-    parser.add_argument('--train_clip_text', action='store_true', required=True, help='Unfreeze CLIP text encoder')
-    parser.add_argument('--use_extracted_features', action='store_true', required=True, help='Use pre-extracted .npy features instead of CLIP visual encoder')
+    parser.add_argument('--force_rl', action='store_true', default=False, help='Force switch to RL stage after resuming')
+    parser.add_argument('--train_clip_visual', action='store_true', default=False, help='Unfreeze CLIP visual encoder wholly')
+    parser.add_argument('--train_clip_visual_layers', type=int, default=0, help='Number of deep layers to unfreeze in CLIP visual encoder (0 means use --train_clip_visual setting)')
+    parser.add_argument('--train_clip_text', action='store_true', default=False, help='Unfreeze CLIP text encoder')
+    parser.add_argument('--use_extracted_features', action='store_true', default=False, help='Use pre-extracted .npy features instead of CLIP visual encoder')
     parser.add_argument('--features_path', type=str, required=True, help='Path to pre-extracted features')
-    parser.add_argument('--clip_model_path', type=str, default='ViT-L/14', help='Path to HF model or CLIP model name. Default ViT-B/32')
+    parser.add_argument('--clip_model_path', type=str, required=True, help='Path to HF model or CLIP model name. Default ViT-B/32')
     args = parser.parse_args()
     print(args)
     worldSize = len(os.environ["CUDA_VISIBLE_DEVICES"].split(','))
