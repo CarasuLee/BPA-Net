@@ -151,11 +151,11 @@ def train_xe(model, dataloader, optim, text_field,  scheduler, loss_fn, e, devic
             
             loss_itm_pos = F.cross_entropy(itm_logits_pos, pos_labels)
             loss_itm_neg = F.cross_entropy(itm_logits_neg, neg_labels)
-            loss_itm = (loss_itm_pos + loss_itm_neg) / 2
+            loss_itm = 0.2 * (loss_itm_pos + loss_itm_neg) / 2
             
             loss_tim_pos = F.cross_entropy(tim_logits_pos, pos_labels)
             loss_tim_neg = F.cross_entropy(tim_logits_neg, neg_labels)
-            loss_tim = (loss_tim_pos + loss_tim_neg) / 2
+            loss_tim = 0.2 * (loss_tim_pos + loss_tim_neg) / 2
 
             loss = loss_ce + loss_itm + loss_tim
 
