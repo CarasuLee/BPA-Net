@@ -26,21 +26,27 @@ class TPA(nn.Module):
         b, c, seq_len = x.shape
         
         x_flat = x
-        
         x_norm = F.normalize(x_flat, p=2, dim=1)
-        
-        proto_flat = self.prototypes
-        
         x_norm_fp32 = x_norm.float()
-        prototypes_fp32 = proto_flat.float()
+        prototypes_fp32 = self.prototypes.float()
 
-        sim = torch.einsum('bcs, pc -> bps', x_norm_fp32, prototypes_fp32)
+        sim_list = []
+        for p_idx in range(self.num_prototypes):
+            proto_p = prototypes_fp32[p_idx:p_idx+1]
+            sim_p = (x_norm_fp32 * proto_p.unsqueeze(-1)).sum(dim=1)
+            sim_list.append(sim_p.unsqueeze(1))
+        sim = torch.cat(sim_list, dim=1)
         
         weights = F.softmax(sim / self.temperature, dim=1)
-
         weights = weights.to(x_flat.dtype)
         
-        aggregated = torch.bmm(weights, x_flat.transpose(1, 2))
+        aggregated_list = []
+        x_T = x_flat.transpose(1, 2)
+        for p_idx in range(self.num_prototypes):
+            w_p = weights[:, p_idx:p_idx+1, :]
+            agg_p = torch.bmm(w_p, x_T)
+            aggregated_list.append(agg_p)
+        aggregated = torch.cat(aggregated_list, dim=1)
         
         return aggregated
 
@@ -59,19 +65,27 @@ class VPE(nn.Module):
         b, c, h, w = x.shape
         
         x_flat = x.view(b, c, -1)
-        
         x_norm = F.normalize(x_flat, p=2, dim=1)
-        
         x_norm_fp32 = x_norm.float()
         prototypes_fp32 = self.prototypes.view(self.num_prototypes, c, 1).float()
-        
-        sim = torch.einsum('bch, pch -> bph', x_norm_fp32, prototypes_fp32)
+
+        sim_list = []
+        for p_idx in range(self.num_prototypes):
+            proto_p = prototypes_fp32[p_idx:p_idx+1]
+            sim_p = (x_norm_fp32 * proto_p).sum(dim=1)
+            sim_list.append(sim_p.unsqueeze(1))
+        sim = torch.cat(sim_list, dim=1)
         
         weights = F.softmax(sim / self.temperature, dim=1)
-        
         weights = weights.to(x_flat.dtype)
         
-        aggregated = torch.bmm(weights, x_flat.transpose(1, 2))
+        aggregated_list = []
+        x_T = x_flat.transpose(1, 2)
+        for p_idx in range(self.num_prototypes):
+            w_p = weights[:, p_idx:p_idx+1, :]
+            agg_p = torch.bmm(w_p, x_T)
+            aggregated_list.append(agg_p)
+        aggregated = torch.cat(aggregated_list, dim=1)
         
         return aggregated
 
