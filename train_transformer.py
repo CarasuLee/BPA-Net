@@ -112,6 +112,13 @@ def evaluate_metrics(model, dataloader, text_field, e, device):
     gen = evaluation.PTBTokenizer.tokenize(gen)
     scores, _ = evaluation.compute_scores(gts, gen)
     return scores
+    
+def contrastive_loss(pos_logits, neg_logits, device, scale=0.05):
+    pos_labels = torch.ones(pos_logits.size(0), dtype=torch.long, device=device)
+    neg_labels = torch.zeros(neg_logits.size(0), dtype=torch.long, device=device)
+    loss_pos = F.cross_entropy(pos_logits, pos_labels)
+    loss_neg = F.cross_entropy(neg_logits, neg_labels)
+    return scale * (loss_pos + loss_neg) / 2
 
 def train_xe(model, dataloader, optim, text_field,  scheduler, loss_fn, e, device):
     model.train()
@@ -146,16 +153,8 @@ def train_xe(model, dataloader, optim, text_field,  scheduler, loss_fn, e, devic
 
             loss_ce = loss_fn(out.view(-1, len(text_field.vocab)), captions_gt.view(-1))
 
-            pos_labels = torch.ones(itm_logits_pos.size(0), dtype=torch.long, device=device)
-            neg_labels = torch.zeros(itm_logits_neg.size(0), dtype=torch.long, device=device)
-            
-            loss_itm_pos = F.cross_entropy(itm_logits_pos, pos_labels)
-            loss_itm_neg = F.cross_entropy(itm_logits_neg, neg_labels)
-            loss_itm = 0.2 * (loss_itm_pos + loss_itm_neg) / 2
-            
-            loss_tim_pos = F.cross_entropy(tim_logits_pos, pos_labels)
-            loss_tim_neg = F.cross_entropy(tim_logits_neg, neg_labels)
-            loss_tim = 0.2 * (loss_tim_pos + loss_tim_neg) / 2
+            loss_itm = contrastive_loss(itm_logits_pos, itm_logits_neg, device)
+            loss_tim = contrastive_loss(tim_logits_pos, tim_logits_neg, device)
 
             loss = loss_ce + loss_itm + loss_tim
 
